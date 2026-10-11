@@ -17,5 +17,5 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh repo sync ${{ github.repository }} \
-            --source UPSTREAM_OWNER/UPSTREAM_REPO \
+            --source storytold/deckcraft \
             --branch main
