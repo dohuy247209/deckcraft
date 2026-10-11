@@ -1,23 +1,21 @@
-name: Sync Single Fork
+name: Sync Fork
 
 on:
   schedule:
-    - cron: '0 0 * * *' # Tự động chạy vào 00:00 mỗi ngày (giờ UTC)
-  workflow_dispatch: # Cho phép bạn bấm nút chạy thủ công bất kỳ lúc nào
+    - cron: '0 0 * * *'   # chạy mỗi 6 giờ
+  workflow_dispatch:         # cho phép chạy thủ công
+
+permissions:
+  contents: write
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Sync Fork via Git Commands
+      - name: Sync fork với upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 1. Cấu hình danh tính Git tạm thời cho máy ảo
-          git config --global user.name "GitHub Action"
-          git config --global user.email "action@github.com"
-          
-          # 2. Sao chép trực tiếp nhánh chính từ kho lưu trữ gốc về máy ảo
-          git clone --bare https://github.com repo_dir
-          cd repo_dir
-          
-          # 3. Đẩy thẳng toàn bộ code đã cập nhật sang kho fork của bạn bằng Token bảo mật có sẵn
-          git push --prune https://x-access-token:${{ secrets.GITHUB_TOKEN }}@://github.com{{ github.repository }}.git +refs/heads/main:refs/heads/main
+          gh repo sync ${{ github.repository }} \
+            --source UPSTREAM_OWNER/UPSTREAM_REPO \
+            --branch main
