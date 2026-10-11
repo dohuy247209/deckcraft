@@ -434,6 +434,10 @@ impl Session {
                 if self.painter.is_some() && !toggle {
                     let _ = self.execute("format.painterApply", &json!({"ids": [id]}));
                 }
+                // Animation Painter applies on click.
+                if self.anim_painter.is_some() && !toggle {
+                    let _ = self.execute("animation.painterApply", &json!({"ids": [id]}));
+                }
             }
             None => {
                 let add = mods.shift || mods.cmd;
@@ -789,7 +793,7 @@ impl Session {
                         let x = xfrm_of(&st.doc, &st.selection, &sh);
                         let local = x.affine().inverse() * p;
                         if let ShapeKind::Table(t) = &sh.kind {
-                            let cell = deckcraft_render_cell(t, local);
+                            let cell = deckcraft_render_cell(t, &table_rows(st, t), local);
                             return self.execute("text.edit", &json!({"id": id, "cell": [cell.0, cell.1]}));
                         }
                         Ok(Value::Null)
@@ -855,16 +859,28 @@ impl Session {
     }
 
     fn set_xfrm(&mut self, id: ShapeId, x: Xfrm) -> Result<()> {
+        // Rows scale from their drawn heights: a stored height is only a minimum (often 0).
+        let drawn = self.active().and_then(|st| match &st.shape(id)?.kind {
+            ShapeKind::Table(t) => Some(table_rows(st, t)),
+            _ => None,
+        });
         self.edit(|doc, sel| {
             let list = crate::shapes_mut(doc, sel).ok_or_else(|| cmd::bad("tool", "no slide"))?;
             if let Some(sh) = deckcraft_model::find_shape_mut(list, id) {
                 sh.xfrm = Some(x);
                 if let ShapeKind::Table(t) = &mut sh.kind {
                     // Tables resize their columns and rows proportionally.
-                    let (tw, th) = (t.width().max(1e-6), t.height().max(1e-6));
-                    let (kx, ky) = (x.w / tw, x.h / th);
+                    let heights: Vec<f64> = match &drawn {
+                        Some(d) if d.len() == t.rows.len() => d.clone(),
+                        _ => t.rows.iter().map(|r| r.height).collect(),
+                    };
+                    let (tw, th) = (t.width().max(1e-6), heights.iter().map(|h| h.max(0.0)).sum::<f64>());
+                    let kx = x.w / tw;
                     t.cols.iter_mut().for_each(|c| *c *= kx);
-                    t.rows.iter_mut().for_each(|r| r.height *= ky);
+                    if th > 1e-6 {
+                        let ky = x.h / th;
+                        t.rows.iter_mut().zip(&heights).for_each(|(r, h)| r.height = h.max(0.0) * ky);
+                    }
                 }
             }
             Ok(())
@@ -1246,10 +1262,12 @@ fn hit_shape(st: &crate::DocState, sh: &Shape, p: Point, tol: f64) -> Option<Hit
 /// Text position under slide point `p` in shape `sh`.
 pub fn text_pos(st: &crate::DocState, sh: &Shape, p: Point) -> (usize, usize) {
     let x = xfrm_of(&st.doc, &st.selection, sh);
-    let local = x.affine().inverse() * p;
     let t = TextSel { shape: sh.id, ..Default::default() };
     match cmd::text::layout_for(st, &t) {
         Some(l) => {
+            // The text's own transform: flips don't mirror text, vertical text is turned.
+            let tr = deckcraft_render::shape_geometry(sh, x.w, x.h).text_rect;
+            let local = deckcraft_render::text_transform(x.affine(), tr, l.rotation).inverse() * p;
             let h = l.hit(local);
             (h.para, h.ch)
         }
@@ -1257,16 +1275,21 @@ pub fn text_pos(st: &crate::DocState, sh: &Shape, p: Point) -> (usize, usize) {
     }
 }
 
-/// Which table cell contains a table-local point.
-fn deckcraft_render_cell(t: &deckcraft_model::Table, p: Point) -> (usize, usize) {
+/// Row heights of table `t` as drawn: rows grow to fit their text.
+pub fn table_rows(st: &crate::DocState, t: &deckcraft_model::Table) -> Vec<f64> {
+    cmd::table_drawn_heights(&st.doc, &st.selection, t)
+}
+
+/// Which table cell contains a table-local point (`heights` from [`table_rows`]).
+fn deckcraft_render_cell(t: &deckcraft_model::Table, heights: &[f64], p: Point) -> (usize, usize) {
     let mut y = 0.0;
-    let mut row = t.rows.len().saturating_sub(1);
-    for (i, r) in t.rows.iter().enumerate() {
-        if p.y < y + r.height {
+    let mut row = heights.len().saturating_sub(1);
+    for (i, h) in heights.iter().enumerate() {
+        if p.y < y + h {
             row = i;
             break;
         }
-        y += r.height;
+        y += h;
     }
     let mut x = 0.0;
     let mut col = t.cols.len().saturating_sub(1);

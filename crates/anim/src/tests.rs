@@ -543,6 +543,117 @@ fn morph_xfrm_interpolates() {
     assert!(m.rot.is_finite());
 }
 
+fn solid(s: Shape, r: u8) -> Shape {
+    Shape { fill: Some(deckcraft_model::Fill::solid(ColorRef::rgb(Rgba { r, g: 0, b: 0, a: 255 }))), ..s }
+}
+
+#[test]
+fn morph_frame_moves_blends_and_fades() {
+    let p = deckcraft_model::defaults::new_presentation(None);
+    let mut a = Slide::default();
+    let mut b = Slide::default();
+    let moved = |id, x| Shape { xfrm: Some(Xfrm::new(x, 100.0, 200.0, 100.0)), ..shape(id, "Box") };
+    a.shapes = vec![solid(moved(1, 0.0), 0), shape(2, "Gone")];
+    let new = Shape { text: Some(TextBody::from_text("Hi")), ..shape(3, "New") };
+    b.shapes = vec![solid(moved(1, 400.0), 200), new, shape(4, "Later")];
+    let f = morph_frame(&p, &a, &b, 0.5, &|id| id == ShapeId(4));
+    assert!((f.mix - 0.5).abs() < 1e-9);
+    // Gone fades out, Box moves halfway and blends red, New fades in, Later stays out.
+    let names: Vec<(&str, bool)> = f.shapes.iter().map(|(s, old)| (s.name.as_str(), *old)).collect();
+    assert_eq!(names, [("Gone", true), ("Box", false), ("New", false)]);
+    let m = &f.shapes[1].0;
+    assert!((m.xfrm.unwrap().x - 200.0).abs() < 1e-9);
+    assert_eq!(m.fill, Some(deckcraft_model::Fill::solid(ColorRef::rgb(Rgba { r: 100, g: 0, b: 0, a: 255 }))));
+    assert_eq!(f.opacity_of(m.id), 1.0);
+    assert!((f.opacity_of(f.shapes[0].0.id) - 0.5).abs() < 1e-9);
+    assert!((f.opacity_of(f.shapes[2].0.id) - 0.5).abs() < 1e-9);
+    // Ids are fresh and unique.
+    let mut ids: Vec<_> = f.shapes.iter().map(|(s, _)| s.id).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 3);
+    assert!(ids.iter().all(|i| i.0 > 4));
+    // At the start only the old slide shows.
+    let f0 = morph_frame(&p, &a, &b, 0.0, &|id| id == ShapeId(4));
+    assert!(f0.shapes.iter().filter(|(s, _)| f0.opacity_of(s.id) > 0.0).all(|(s, _)| s.name != "New"));
+    assert_eq!(morph_frame(&p, &a, &b, f64::NAN, &|_| false).mix, 0.0);
+}
+
+#[test]
+fn morph_frame_cross_fades_changed_content() {
+    let p = deckcraft_model::defaults::new_presentation(None);
+    let mut a = Slide::default();
+    let mut b = Slide::default();
+    a.shapes = vec![Shape { text: Some(TextBody::from_text("Before")), ..shape(1, "T") }];
+    b.shapes = vec![Shape { text: Some(TextBody::from_text("After")), ..shape(1, "T") }];
+    let f = morph_frame(&p, &a, &b, 0.25, &|_| false);
+    // The new text under the fading old one, both on the moving box.
+    assert_eq!(f.shapes.len(), 2);
+    assert_eq!((&f.shapes[0].0.text, f.shapes[0].1), (&b.shapes[0].text, false));
+    assert_eq!((&f.shapes[1].0.text, f.shapes[1].1), (&a.shapes[0].text, true));
+    let s = f.mix;
+    assert!((f.opacity_of(f.shapes[0].0.id) - s).abs() < 1e-9);
+    assert!((f.opacity_of(f.shapes[1].0.id) - (1.0 - s)).abs() < 1e-9);
+}
+
+#[test]
+fn morph_frame_lists_texts_for_words_and_characters() {
+    let p = deckcraft_model::defaults::new_presentation(None);
+    let mut a = Slide::default();
+    let mut b = Slide::default();
+    a.shapes = vec![Shape { text: Some(TextBody::from_text("The Science")), ..shape(1, "T") }];
+    b.shapes = vec![Shape { text: Some(TextBody::from_text("Science rocks")), ..shape(1, "T") }];
+    for (option, want) in [("objects", None), ("words", Some(false)), ("characters", Some(true))] {
+        b.transition = Some(Transition { kind: "morph".into(), option: option.into(), ..Default::default() });
+        let f = morph_frame(&p, &a, &b, 0.5, &|_| false);
+        assert_eq!(f.text.first().map(|m| m.chars), want, "{option}");
+        if let Some(m) = f.text.first() {
+            assert_eq!((m.new, m.old), (f.shapes[0].0.id, f.shapes[1].0.id));
+            assert_eq!(m.from, a.shapes[0].xfrm.unwrap());
+        }
+    }
+    // Same text: one shape moves, nothing to morph.
+    b.shapes[0].text = a.shapes[0].text.clone();
+    assert!(morph_frame(&p, &a, &b, 0.5, &|_| false).text.is_empty());
+}
+
+#[test]
+fn morph_frame_morphs_the_outline_of_a_changed_geometry() {
+    let p = deckcraft_model::defaults::new_presentation(None);
+    let mut a = Slide::default();
+    let mut b = Slide::default();
+    let geo = |s: Shape, g: &str| Shape { geom: deckcraft_model::Geom::preset(g), ..s };
+    a.shapes = vec![solid(geo(shape(1, "Form"), "ellipse"), 0)];
+    b.shapes = vec![solid(Shape { xfrm: Some(Xfrm::new(300.0, 100.0, 100.0, 100.0)), ..geo(shape(1, "Form"), "star5") }, 200)];
+    let f = morph_frame(&p, &a, &b, 0.5, &|_| false);
+    // One shape: the new one, on the moving box, its colour blending and its outline listed to morph.
+    assert_eq!(f.shapes.len(), 1);
+    let (m, old) = &f.shapes[0];
+    assert!(!old && m.geom == b.shapes[0].geom);
+    assert_eq!(f.opacity_of(m.id), 1.0);
+    assert_eq!(m.fill, Some(deckcraft_model::Fill::solid(ColorRef::rgb(Rgba { r: 100, g: 0, b: 0, a: 255 }))));
+    assert_eq!(f.paths.len(), 1);
+    assert_eq!(f.paths[0].id, m.id);
+    assert_eq!(f.paths[0].from, a.shapes[0].geom);
+    assert_eq!((f.paths[0].from_box, f.paths[0].to_box), (a.shapes[0].xfrm.unwrap(), b.shapes[0].xfrm.unwrap()));
+    // Other adjust values of the same preset morph too.
+    b.shapes[0].geom = deckcraft_model::Geom::Preset { name: "ellipse".into(), adj: vec![1.0] };
+    assert_eq!(morph_frame(&p, &a, &b, 0.5, &|_| false).paths.len(), 1);
+    // The same geometry only moves.
+    b.shapes[0].geom = a.shapes[0].geom.clone();
+    assert!(morph_frame(&p, &a, &b, 0.5, &|_| false).paths.is_empty());
+    // Another text as well: the two cross-fade as before.
+    b.shapes[0].geom = deckcraft_model::Geom::preset("star5");
+    b.shapes[0].text = Some(TextBody::from_text("Star"));
+    let f = morph_frame(&p, &a, &b, 0.5, &|_| false);
+    assert!(f.paths.is_empty() && f.shapes.len() == 2);
+    // Tables and groups have no outline to morph.
+    let table = |g: &str| Shape { kind: deckcraft_model::ShapeKind::Table(Default::default()), ..geo(shape(1, "Form"), g) };
+    a.shapes = vec![table("rect")];
+    b.shapes = vec![table("ellipse")];
+    assert!(morph_frame(&p, &a, &b, 0.5, &|_| false).paths.is_empty());
+}
+
 fn pres(n: usize) -> Presentation {
     Presentation { slides: (0..n).map(|i| Arc::new(Slide { id: SlideId(1000 + i as u32), ..Default::default() })).collect(), ..Default::default() }
 }
@@ -649,4 +760,32 @@ fn compose_and_sanitize() {
     assert!((c.opacity - 0.25).abs() < 1e-9 && c.offset_x == 3.0 && c.clip == Some([0.25, 0.0, 0.5, 1.0]));
     let bad = AnimState { opacity: f64::NAN, rotate: f64::INFINITY, clip: Some([f64::NAN, 2.0, -1.0, 0.5]), ..Default::default() }.sanitized();
     assert!(finite(&bad));
+}
+
+#[test]
+fn show_follows_links() {
+    use deckcraft_model::text::Action;
+    let mut p = pres(4);
+    Arc::make_mut(&mut p.slides[3]).hidden = true;
+    let mut s = ShowState::new(&p);
+    assert_eq!(s.follow(&p, &Action::Slide { slide: SlideId(1002) }, None), LinkJump::Show(ShowAction::Slide(2)));
+    assert_eq!(s.follow(&p, &Action::PreviousSlide, None), LinkJump::Show(ShowAction::Slide(1)));
+    assert_eq!(s.follow(&p, &Action::NextSlide, None), LinkJump::Show(ShowAction::Slide(2)));
+    // Last skips the hidden slide; a link to the hidden slide shows it.
+    assert_eq!(s.follow(&p, &Action::LastSlide, None), LinkJump::Show(ShowAction::Slide(2)));
+    assert_eq!(s.follow(&p, &Action::Slide { slide: SlideId(1003) }, None), LinkJump::Show(ShowAction::Slide(3)));
+    assert_eq!(s.follow(&p, &Action::FirstSlide, None), LinkJump::Show(ShowAction::Slide(0)));
+    assert_eq!(s.follow(&p, &Action::LastViewed, Some(3)), LinkJump::Show(ShowAction::Slide(3)));
+    assert_eq!(s.slide, 3);
+    assert_eq!(s.follow(&p, &Action::Url { url: "https://example.org".into() }, None), LinkJump::Open("https://example.org".into()));
+    for bad in
+        ["file:///etc/passwd", "javascript:alert(1)", "ms-settings:", "smb://host/share", "C:\\Windows\\calc.exe", "../notes.txt", "https:", ""]
+    {
+        assert_eq!(s.follow(&p, &Action::Url { url: bad.into() }, None), LinkJump::None, "{bad} must not open");
+    }
+    assert_eq!(s.follow(&p, &Action::Url { url: " MAILTO:a@example.org".into() }, None), LinkJump::Open("MAILTO:a@example.org".into()));
+    assert_eq!(s.follow(&p, &Action::EndShow, None), LinkJump::Exit);
+    assert_eq!(s.follow(&p, &Action::Slide { slide: SlideId(9) }, None), LinkJump::None, "a link to a deleted slide does nothing");
+    assert_eq!(s.follow(&p, &Action::LastViewed, None), LinkJump::None);
+    assert_eq!(s.slide, 3);
 }

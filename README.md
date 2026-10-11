@@ -58,7 +58,7 @@
 
 ## What works today
 
-DeckCraft is in early development, heading for its first alpha (see the [roadmap](ROADMAP.md)).
+DeckCraft is in alpha, heading for beta (see the [roadmap](ROADMAP.md)).
 Today it can:
 
 - **Make decks**: slide masters and eleven layouts with placeholders that inherit position and
@@ -103,9 +103,42 @@ cd deckcraft
 cargo run --release -p deckcraft-cli -- render --sample --all --scale 1 out/
 ```
 
+On Linux, the build also needs the ALSA headers for slide-show sound: `alsa-lib-devel` on Fedora,
+`libasound2-dev` on Debian and Ubuntu, `alsa-lib` on Arch. Without them it stops at `alsa-sys`.
+
 Fonts come from [craft-fonts](https://github.com/storytold/craft-fonts): clone it next to this repo
 (`../craft-fonts`) and local builds pick it up automatically; without it DeckCraft uses your system
 fonts.
+
+Each [GitHub release](https://github.com/storytold/deckcraft/releases) has ready-made builds, on Linux as
+an AppImage, a `.deb`, an `.rpm` and a tarball. On Gentoo, the community [::snakebyte
+overlay](https://github.com/switch87/snakebyte-overlay) packages the Linux release as
+`app-office/deckcraft-bin` (not maintained by the DeckCraft team):
+
+```sh
+eselect repository add snakebyte git https://github.com/switch87/snakebyte-overlay.git
+emaint sync -r snakebyte
+echo 'app-office/deckcraft-bin ~amd64' >> /etc/portage/package.accept_keywords/deckcraft
+emerge --ask app-office/deckcraft-bin
+```
+
+### Logs
+
+The desktop app writes its `log` records to standard error and to `logs/deckcraft.log` in the
+settings directory, beside `ui.json` and `prefs.json` (Linux `~/.config/deckcraft/logs/`, or
+`$XDG_CONFIG_HOME/deckcraft/logs/`; macOS `~/Library/Application Support/DeckCraft/logs/`; Windows
+`%APPDATA%\DeckCraft\logs\`). A start from a desktop menu or the Dock has no terminal, so this file
+is what to attach to a bug report: the crash guard's panic report, a failed crash-recovery save,
+PowerPoint parts skipped on import and audio output problems land there. Each launch moves the
+previous log to `deckcraft.1.log` (and that one to `deckcraft.2.log`), so the log of a run that
+crashed survives the next start. The file stops growing at 16 MiB. `--version` writes no file.
+
+| Variable | Effect |
+|---|---|
+| `RUST_LOG` | Log levels for standard error and the log file. Default: `info` for DeckCraft's own crates, `warn` for everything else. env_logger-style directives replace that, e.g. `RUST_LOG=debug`, `RUST_LOG=warn,deckcraft_pptx=trace` or `RUST_LOG=info,wgpu_core=warn`; a directive ending in `*` covers every target starting with it (`deckcraft*=debug`). |
+
+The logger is `apps/deckcraft/src/logging.rs`; the realtime audio callback does not log. The web
+app logs to the browser console instead.
 
 ## Agents, CLI and MCP
 
@@ -121,10 +154,12 @@ deckcraft-cli mcp --connect 7990        # drive the running app (deckcraft --con
 
 ## Roadmap
 
-DeckCraft covers about **79% of PowerPoint's features by breadth** (93% of the core ones) and is
-roughly **80% of the way to a first alpha**. See [ROADMAP.md](ROADMAP.md) for the alpha checklist,
-parity estimates and what's next, and [docs/parity.md](docs/parity.md) for the feature-by-feature
-scorecard.
+DeckCraft is in **alpha**. It covers **79% of PowerPoint's features by breadth** (92% of the core
+ones, measured) and is about **55% of the way to replacing PowerPoint for real work** (estimated).
+See [ROADMAP.md](ROADMAP.md) for the stage, numbers by dimension and what's next,
+[docs/target-app-parity.md](docs/target-app-parity.md) for the full assessment,
+[docs/gaps.md](docs/gaps.md) for every known shortfall and
+[docs/parity-checklist.md](docs/parity-checklist.md) for the feature-by-feature checklist.
 
 ## Downloads
 
@@ -139,6 +174,21 @@ scorecard.
 | x86 (32-bit) | `deckcraft-<ver>-windows-x86.msi` | `deckcraft-<ver>-windows-x86-portable.zip` |
 
 Installers and executables are code-signed.
+
+**If the app doesn't open on Windows:** the desktop app initializes only DirectX 12 by default.
+Letting wgpu also create an OpenGL instance can crash some graphics drivers (AMD's
+`atio6axx.dll`) before the window appears, so the app would flash in Task Manager and quit.
+`WGPU_BACKEND` overrides the default for troubleshooting (for example `dx12` or `vulkan`). In
+PowerShell, from the folder containing the executable:
+
+```powershell
+$env:WGPU_BACKEND = "vulkan"
+& .\deckcraft.exe
+Remove-Item Env:WGPU_BACKEND                     # restore the default for later launches
+```
+
+An explicit `gl` override can bring the driver crash back on affected systems. The macOS, Linux
+and web backend defaults are unchanged.
 
 ### macOS
 
@@ -156,6 +206,8 @@ Installers and executables are code-signed.
 | Debian/Ubuntu | `deckcraft-<ver>-linux-x86_64.deb` | `deckcraft-<ver>-linux-aarch64.deb` | |
 | Fedora/RHEL/openSUSE | `deckcraft-<ver>-linux-x86_64.rpm` | `deckcraft-<ver>-linux-aarch64.rpm` | |
 | Tarball | `deckcraft-<ver>-linux-x86_64.tar.gz` | `deckcraft-<ver>-linux-aarch64.tar.gz` | Unpack anywhere |
+
+RISC-V 64 (riscv64): `deckcraft-<ver>-linux-riscv64.tar.gz`, a tarball only (cross-compiled; needs glibc 2.39+, e.g. Ubuntu 24.04+).
 
 ### FreeBSD
 

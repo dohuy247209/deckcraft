@@ -686,3 +686,47 @@ fn bisect_slide_variants() {
         std::fs::write(format!("{dir}/v-only{k}.pptx"), one(s)).expect("write");
     }
 }
+
+#[test]
+fn rtl_paragraphs_script_fonts_and_just_low_round_trip() {
+    let mut p = rich_deck();
+    let fonts = &mut Arc::make_mut(&mut p.masters[0]).theme.fonts;
+    fonts.minor.cs = "Noto Naskh Arabic".into();
+    fonts.minor.scripts = vec![
+        deckcraft_model::theme::ScriptFont { script: "Arab".into(), typeface: "Noto Naskh Arabic".into() },
+        deckcraft_model::theme::ScriptFont { script: "Hebr".into(), typeface: "Noto Sans Hebrew".into() },
+    ];
+    let slide = Arc::make_mut(&mut p.slides[0]);
+    let sh = slide.shapes.iter_mut().find(|s| s.text.is_some()).expect("a text shape");
+    let body = sh.text.as_mut().expect("text");
+    body.paragraphs = vec![Paragraph { runs: vec![Run::new("سنة 2024 (Retrait) فقط")], ..Default::default() }];
+    body.paragraphs[0].props.rtl = Some(true);
+    body.paragraphs[0].props.align = Some(Align::JustLow);
+    let name = sh.name.clone();
+    let q = round(&p);
+    assert_eq!(q.masters[0].theme.fonts.minor.scripts, p.masters[0].theme.fonts.minor.scripts);
+    assert_eq!(q.masters[0].theme.fonts.minor.script("arab"), Some("Noto Naskh Arabic"));
+    let para = &by_name(&q.slides[0], &name).text.as_ref().expect("text").paragraphs[0];
+    assert_eq!(para.props.rtl, Some(true));
+    assert_eq!(para.props.align, Some(Align::JustLow));
+    assert_eq!(para.runs[0].text, "سنة 2024 (Retrait) فقط");
+}
+
+#[test]
+fn date_fields_keep_their_type_and_saved_text() {
+    // An automatic date is a field (its saved text is what readers without a clock show); a fixed
+    // date is plain text.
+    let mut p = Presentation::default();
+    let mut auto = shape(&mut p, "Auto date", 10.0, 10.0, 200.0, 40.0);
+    let mut body = TextBody::from_text("");
+    body.paragraphs[0].runs =
+        vec![Run { text: "March 3, 2025".into(), props: RunProps::default(), kind: RunKind::Field { field: "datetime4".into() } }];
+    auto.text = Some(body);
+    let mut fixed = shape(&mut p, "Fixed date", 10.0, 60.0, 200.0, 40.0);
+    fixed.text = Some(TextBody::from_text("Launch day"));
+    Arc::make_mut(&mut p.slides[0]).shapes = vec![auto, fixed];
+    let q = round(&p);
+    for name in ["Auto date", "Fixed date"] {
+        assert_eq!(by_name(&q.slides[0], name).text, by_name(&p.slides[0], name).text, "{name}");
+    }
+}

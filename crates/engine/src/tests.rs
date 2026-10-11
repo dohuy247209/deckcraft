@@ -366,3 +366,180 @@ fn freeform_tools_and_command() {
         g => panic!("{g:?}"),
     }
 }
+
+#[test]
+fn double_click_in_table_uses_grown_row_heights() {
+    // Rows stored 4 pt tall are drawn tall enough for their text, so 6 pt down is still row 0.
+    let mut s = session();
+    let data = json!([["a", "b"], ["c", "d"], ["e", "f"]]);
+    let id = s.execute("insert.table", &json!({"rows": 3, "cols": 2, "rect": [100.0, 100.0, 400.0, 120.0], "data": data})).unwrap()["id"].clone();
+    for row in 0..3 {
+        s.execute("table.rowHeight", &json!({"id": id, "row": row, "height": 4.0})).unwrap();
+    }
+    let ev = |kind, x, y| PointerEvent { kind, x, y, mods: Mods::default(), tol: 3.0 };
+    s.pointer(ev(PointerKind::DoubleClick, 120.0, 106.0)).unwrap();
+    assert_eq!(s.doc().unwrap().selection.text.as_ref().and_then(|t| t.cell), Some((0, 0)));
+}
+
+#[test]
+fn grown_table_frame_covers_its_drawn_rows() {
+    // Rows stored 4 pt tall are drawn taller: the box, its handles and hit tests follow the drawn rows.
+    let mut s = session();
+    let data = json!([["a", "b"], ["c", "d"], ["e", "f"]]);
+    let id = s.execute("insert.table", &json!({"rows": 3, "cols": 2, "rect": [100.0, 100.0, 400.0, 120.0], "data": data})).unwrap()["id"].clone();
+    for row in 0..3 {
+        s.execute("table.rowHeight", &json!({"id": id, "row": row, "height": 4.0})).unwrap();
+    }
+    let st = s.doc().unwrap();
+    let sh = st.shapes().iter().find(|sh| json!(sh.id) == id).unwrap().clone();
+    let deckcraft_model::ShapeKind::Table(t) = &sh.kind else { panic!("not a table") };
+    let drawn: f64 = tools::table_rows(st, t).iter().sum();
+    assert!(drawn > 12.0, "rows should grow: {drawn}");
+    let x = cmd::xfrm_of(&st.doc, &st.selection, &sh);
+    assert!((x.h - drawn).abs() < 1e-6, "frame {} vs drawn {drawn}", x.h);
+    let below_stored = deckcraft_geom::Point::new(120.0, 100.0 + drawn - 2.0);
+    assert!(matches!(s.hit_test(below_stored, 1.0), Some(tools::Hit::Shape { .. })));
+}
+
+#[test]
+fn right_to_left_paragraphs() {
+    let mut s = session();
+    let title = s.doc().unwrap().current_slide().unwrap().shapes[0].id.0;
+    s.execute("text.edit", &json!({"id": title})).unwrap();
+    s.execute("text.insert", &json!({"text": "سنة 2024 (Retrait) فقط"})).unwrap();
+    s.execute("format.rtl", &json!({})).unwrap();
+    let para = |s: &Session| s.doc().unwrap().current_slide().unwrap().shapes[0].text.as_ref().unwrap().paragraphs[0].props.clone();
+    assert_eq!(para(&s).rtl, Some(true));
+    // Left (the default) becomes right: the text stays at its start edge.
+    assert_eq!(para(&s).align, Some(deckcraft_model::text::Align::Right));
+    s.execute("format.align", &json!({"align": "justifyLow"})).unwrap();
+    assert_eq!(para(&s).align, Some(deckcraft_model::text::Align::JustLow));
+    // Toggling back keeps a justified alignment.
+    s.execute("format.rtl", &json!({})).unwrap();
+    assert_eq!(para(&s).rtl, Some(false));
+    assert_eq!(para(&s).align, Some(deckcraft_model::text::Align::JustLow));
+    s.execute("format.rtl", &json!({"on": true})).unwrap();
+    s.execute("format.alignLeft", &json!({})).unwrap();
+    s.execute("format.rtl", &json!({"on": false})).unwrap();
+    assert_eq!(para(&s).align, Some(deckcraft_model::text::Align::Right));
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(para(&s).rtl, Some(true));
+}
+
+#[test]
+fn header_footer_fixed_date_is_the_slides_own_text() {
+    use deckcraft_model::text::RunKind;
+    let mut s = session();
+    let date = |s: &Session| {
+        let slide = s.doc().unwrap().current_slide().unwrap();
+        slide.shapes.iter().find(|x| x.ph_type() == Some(deckcraft_model::PhType::Date)).and_then(|x| x.text.clone()).unwrap()
+    };
+    let kind = |s: &Session| date(s).paragraphs[0].runs[0].kind.clone();
+    // Automatic: a date field, saved with today's date.
+    s.execute("design.headerFooter", &json!({"date": true})).unwrap();
+    assert_eq!(kind(&s), RunKind::Field { field: "datetime1".into() });
+    assert_eq!(date(&s).text().matches('/').count(), 2, "M/D/YYYY");
+    // Fixed: plain text in the slide's own placeholder (other slides' fields aren't affected).
+    s.execute("design.headerFooter", &json!({"date": true, "dateText": "Launch day"})).unwrap();
+    assert_eq!((kind(&s), date(&s).text()), (RunKind::Text, "Launch day".to_string()));
+    // Back to automatic.
+    s.execute("design.headerFooter", &json!({"date": true, "dateText": ""})).unwrap();
+    assert!(matches!(kind(&s), RunKind::Field { .. }));
+    // A new date field is saved with the date it shows.
+    s.execute("text.edit", &json!({"id": s.doc().unwrap().current_slide().unwrap().shapes[0].id.0})).unwrap();
+    s.execute("text.insert", &json!({"text": "Updated "})).unwrap();
+    s.execute("insert.dateTime", &json!({"format": "datetime10"})).unwrap();
+    let title = s.doc().unwrap().current_slide().unwrap().shapes[0].text.clone().unwrap();
+    let run = title.paragraphs[0].runs.iter().find(|r| matches!(r.kind, RunKind::Field { .. })).cloned().unwrap();
+    assert!(run.text.contains(':'), "H:mm {run:?}");
+}
+
+/// (text, linked?) of each run in the first paragraph of the current slide's title.
+fn title_runs(s: &Session) -> Vec<(String, bool)> {
+    let sh = &s.doc().unwrap().current_slide().unwrap().shapes[0];
+    let p = &sh.text.as_ref().unwrap().paragraphs[0];
+    p.runs.iter().map(|r| (r.text.clone(), r.props.link.is_some())).collect()
+}
+
+#[test]
+fn hyperlink_with_a_bare_caret_inserts_the_address() {
+    // #31: with the caret at the end of the text, Insert Hyperlink used to format an empty range
+    // and change nothing.
+    let mut s = session();
+    let title = s.doc().unwrap().current_slide().unwrap().shapes[0].id.0;
+    s.execute("text.edit", &json!({"id": title})).unwrap();
+    s.execute("text.insert", &json!({"text": "See "})).unwrap();
+    s.execute("insert.hyperlink", &json!({"url": "https://example.org"})).unwrap();
+    s.execute("text.insert", &json!({"text": " now"})).unwrap();
+    assert_eq!(
+        title_runs(&s),
+        vec![("See ".into(), false), ("https://example.org".into(), true), (" now".into(), false)],
+        "the address is inserted as a link, and typing after it doesn't extend it"
+    );
+}
+
+#[test]
+fn hyperlink_display_text_and_targets() {
+    let mut s = session();
+    let title = s.doc().unwrap().current_slide().unwrap().shapes[0].id.0;
+    s.execute("text.edit", &json!({"id": title})).unwrap();
+    s.execute("insert.hyperlink", &json!({"url": "mailto:a@b.org"})).unwrap();
+    assert_eq!(title_runs(&s), vec![("a@b.org".into(), true)], "email links show the address without mailto:");
+    s.execute("text.insert", &json!({"text": " "})).unwrap();
+    s.execute("insert.hyperlink", &json!({"slide": 0, "text": "start"})).unwrap();
+    assert_eq!(title_runs(&s), vec![("a@b.org".into(), true), (" ".into(), false), ("start".into(), true)]);
+}
+
+#[test]
+fn hyperlink_on_a_word_or_shape_links_it() {
+    let mut s = session();
+    let title = s.doc().unwrap().current_slide().unwrap().shapes[0].id.0;
+    s.execute("text.edit", &json!({"id": title})).unwrap();
+    s.execute("text.insert", &json!({"text": "Hello world"})).unwrap();
+    s.execute("text.move", &json!({"to": "left"})).unwrap();
+    s.execute("insert.hyperlink", &json!({"url": "https://example.org"})).unwrap();
+    assert_eq!(title_runs(&s), vec![("Hello ".into(), false), ("world".into(), true)], "a caret inside a word links the word");
+    s.execute("text.exit", &json!({})).unwrap();
+    s.execute("insert.hyperlink", &json!({"url": "https://example.org"})).unwrap();
+    assert!(s.doc().unwrap().current_slide().unwrap().shapes[0].click.is_some(), "a selected shape gets the link as its click action");
+}
+
+#[test]
+fn clicks_in_flipped_shapes_hit_the_text_where_it_is_drawn() {
+    // Flips don't mirror text, so a click lands on the character drawn under it.
+    let mut s = session();
+    let r = s.execute("shape.insert", &json!({"preset": "rect", "rect": [100, 100, 400, 100], "text": "Hello flipped world"})).unwrap();
+    let id = deckcraft_model::ShapeId(r["id"].as_u64().unwrap() as u32);
+    let pos = |s: &Session, x: f64, y: f64| {
+        let st = s.doc().unwrap();
+        tools::text_pos(st, st.shape(id).unwrap(), deckcraft_geom::Point::new(x, y))
+    };
+    let xs = [240.0, 300.0, 360.0];
+    let plain = xs.map(|x| pos(&s, x, 150.0));
+    assert!(plain[0].1 < plain[1].1 && plain[1].1 < plain[2].1, "{plain:?}");
+    s.execute("shape.flip", &json!({"axis": "horizontal"})).unwrap();
+    assert_eq!(xs.map(|x| pos(&s, x, 150.0)), plain);
+    // flipV turns the text 180° about the box centre (300, 150).
+    s.execute("shape.flip", &json!({"axis": "horizontal"})).unwrap();
+    s.execute("shape.flip", &json!({"axis": "vertical"})).unwrap();
+    assert_eq!(xs.map(|x| pos(&s, 600.0 - x, 150.0)), plain);
+}
+
+#[test]
+fn inserted_hyperlinks_look_like_links() {
+    let mut s = session();
+    let title = s.doc().unwrap().current_slide().unwrap().shapes[0].id.0;
+    s.execute("text.edit", &json!({"id": title})).unwrap();
+    s.execute("text.insert", &json!({"text": "Read the docs"})).unwrap();
+    s.execute("text.move", &json!({"to": "wordLeft", "extend": true})).unwrap();
+    assert_eq!(s.execute("format.state", &json!({})).unwrap()["underline"], false);
+    s.execute("insert.hyperlink", &json!({"url": "https://example.org"})).unwrap();
+    // Underlined (and hlink-coloured: same resolution as files) without touching the run's own props.
+    assert_eq!(s.execute("format.state", &json!({})).unwrap()["underline"], true);
+    let body = s.doc().unwrap().current_slide().unwrap().shapes[0].text.clone().unwrap();
+    let run = body.paragraphs[0].runs.iter().find(|r| r.props.link.is_some()).unwrap();
+    assert!(run.props.fill.is_none() && run.props.underline.is_none(), "{run:?}");
+    // Underline off is the run's own u="none", as in PowerPoint.
+    s.execute("format.underline", &json!({})).unwrap();
+    assert_eq!(s.execute("format.state", &json!({})).unwrap()["underline"], false);
+}
