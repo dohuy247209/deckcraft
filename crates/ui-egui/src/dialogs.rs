@@ -42,6 +42,7 @@ fn title(id: &str) -> &'static str {
         "altText" => "Alt Text",
         "outline" => "Slides from Outline",
         "renameSection" => "Rename Section",
+        "reuseSlides" => "Reuse Slides",
         "renameShape" => "Rename",
         "renameLayout" => "Rename Layout",
         "paragraph" => "Paragraph",
@@ -51,6 +52,7 @@ fn title(id: &str) -> &'static str {
         "preferences" => "Preferences",
         "autocorrect" => "AutoCorrect",
         "gridOptions" => "Grid Options",
+        "columns" => "Columns",
         "export" => "Export",
         "symbol" => "Symbol",
         "photoAlbum" => "Photo Album",
@@ -272,7 +274,7 @@ fn pick_album_picture(app: &mut SlideApp) -> Option<Value> {
         app.set_status("That picture is larger than 32 MB");
         return None;
     }
-    let name = std::path::Path::new(&path).file_name().and_then(|n| n.to_str()).filter(|s| !s.is_empty()).unwrap_or("picture").to_string();
+    let name = std::path::Path::new(&path).file_name().and_then(std::ffi::OsStr::to_str).filter(|s| !s.is_empty()).unwrap_or("picture").to_string();
     Some(json!({"name": name, "data": deckcraft_engine::cmd::base64_encode(&loaded)}))
 }
 
@@ -1091,6 +1093,25 @@ fn body(app: &mut SlideApp, ui: &mut Ui, d: &mut Dialog) -> bool {
             let hf = app.session.active().map(|s| s.doc.header_footer.clone()).unwrap_or_default();
             let date = check(ui, d, "Date and time", "date", hf.date);
             field(ui, d, "  Fixed date (empty = update automatically):", "dateText", &hf.date_text);
+            // The format applies to an automatic date; a fixed one is the text as typed.
+            let automatic = d.get("dateText", &hf.date_text).is_empty();
+            let fmt_now = if hf.date_format.is_empty() { "datetime1".to_string() } else { hf.date_format.clone() };
+            // Not `d.get`: that stores the default as if the user had picked it.
+            let fmt = d.fields.get("dateFormat").cloned().unwrap_or_else(|| fmt_now.clone());
+            let rows = date_rows("en-US");
+            let label = rows.iter().find(|(k, _)| *k == fmt).map(|(_, s)| s.clone()).unwrap_or_else(|| fmt.clone());
+            ui.add_enabled_ui(date && automatic, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("  Format:");
+                    egui::ComboBox::from_id_salt("hf-date-format").selected_text(label).width(200.0).show_ui(ui, |ui| {
+                        for (kind, sample) in &rows {
+                            if ui.selectable_label(fmt == *kind, sample).clicked() {
+                                d.fields.insert("dateFormat".into(), (*kind).to_string());
+                            }
+                        }
+                    });
+                });
+            });
             let num_on = check(ui, d, "Slide number", "num", hf.slide_number);
             let foot = check(ui, d, "Footer", "footer", hf.footer);
             field(ui, d, "  Footer text:", "footerText", &hf.footer_text);
@@ -1108,11 +1129,20 @@ fn body(app: &mut SlideApp, ui: &mut Ui, d: &mut Dialog) -> bool {
             if apply || apply_all {
                 let dt = d.get("dateText", "");
                 let ft = d.get("footerText", "");
-                run(
-                    app,
-                    "design.headerFooter",
-                    json!({"date": date, "dateText": dt, "slideNumber": num_on, "footer": foot, "footerText": ft, "hideOnTitle": hide, "all": apply_all}),
-                );
+                let mut params = serde_json::Map::new();
+                params.insert("date".into(), json!(date));
+                params.insert("dateText".into(), json!(dt));
+                // Only a format the user picked: sending the default would rewrite every slide's
+                // existing date field (an imported datetime4, say) to datetime1.
+                if d.fields.contains_key("dateFormat") {
+                    params.insert("dateFormat".into(), json!(d.get("dateFormat", &fmt_now)));
+                }
+                params.insert("slideNumber".into(), json!(num_on));
+                params.insert("footer".into(), json!(foot));
+                params.insert("footerText".into(), json!(ft));
+                params.insert("hideOnTitle".into(), json!(hide));
+                params.insert("all".into(), json!(apply_all));
+                run(app, "design.headerFooter", serde_json::Value::Object(params));
             }
             apply || apply_all || d.fields.contains_key("cancel")
         }
@@ -1537,6 +1567,66 @@ fn body(app: &mut SlideApp, ui: &mut Ui, d: &mut Dialog) -> bool {
             }
             ok || cancel
         }
+        "reuseSlides" => {
+            let path = d.params.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+            let slides: Vec<(usize, String)> = d
+                .params
+                .get("slides")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| {
+                            Some((usize::try_from(x.get("index")?.as_u64()?).ok()?, x.get("title").and_then(Value::as_str).unwrap_or("").to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(path.clone());
+            ui.label(format!("Insert slides from {name} after the current slide:"));
+            // Unticked slides are remembered by index; everything starts ticked.
+            let off = |d: &Dialog, i: usize| d.fields.get(&format!("off{i}")).is_some_and(|v| v == "1");
+            ui.horizontal(|ui| {
+                if ui.small_button("Select All").clicked() {
+                    for (i, _) in &slides {
+                        d.fields.remove(&format!("off{i}"));
+                    }
+                }
+                if ui.small_button("Select None").clicked() {
+                    for (i, _) in &slides {
+                        d.fields.insert(format!("off{i}"), "1".into());
+                    }
+                }
+            });
+            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                for (i, title) in &slides {
+                    let mut on = !off(d, *i);
+                    let label = if title.trim().is_empty() { format!("{}  (no title)", i + 1) } else { format!("{}  {}", i + 1, title.trim()) };
+                    if ui.checkbox(&mut on, label).changed() {
+                        if on {
+                            d.fields.remove(&format!("off{i}"));
+                        } else {
+                            d.fields.insert(format!("off{i}"), "1".into());
+                        }
+                    }
+                }
+            });
+            let mut keep = d.params.get("keep").and_then(Value::as_bool).unwrap_or(false);
+            if ui.checkbox(&mut keep, "Keep source formatting").changed()
+                && let Some(o) = d.params.as_object_mut()
+            {
+                o.insert("keep".into(), json!(keep));
+            }
+            let picked: Vec<usize> = slides.iter().map(|(i, _)| *i).filter(|i| !off(d, *i)).collect();
+            let (ok, cancel) = buttons(ui, "Insert");
+            if ok {
+                if picked.is_empty() {
+                    app.set_status("Tick at least one slide to insert".to_string());
+                    return false;
+                }
+                app.reuse_slides(&path, keep, &picked);
+            }
+            ok || cancel
+        }
         "renameSection" | "renameShape" | "renameLayout" => {
             let cur = d.params.get("name").and_then(Value::as_str).unwrap_or("").to_string();
             field(ui, d, "Name:", "name", &cur);
@@ -1565,6 +1655,7 @@ fn body(app: &mut SlideApp, ui: &mut Ui, d: &mut Dialog) -> bool {
                 ("PowerPoint Presentation (.pptx)", "pptx"),
                 ("Outline (.txt)", "outline"),
                 ("Animated GIF (.gif)", "gif"),
+                ("Outline/RTF (.rtf)", "rtf"),
             ] {
                 if ui.radio(fmt == f, l).clicked() {
                     d.fields.insert("fmt".into(), f.into());
@@ -2110,8 +2201,8 @@ fn body(app: &mut SlideApp, ui: &mut Ui, d: &mut Dialog) -> bool {
                 }
                 _ => about(app, ui),
             }
-            let (ok, _) = buttons(ui, "Close");
-            ok
+            let (ok, cancel) = buttons(ui, "Close");
+            ok || cancel
         }
         "autocorrect" => {
             let pr = &mut app.session.prefs;
@@ -2121,6 +2212,7 @@ fn body(app: &mut SlideApp, ui: &mut Ui, d: &mut Dialog) -> bool {
             ui.checkbox(&mut pr.ac_caps_lock, "Correct accidental use of cAPS LOCK key");
             ui.checkbox(&mut pr.ac_fractions, "Replace fractions (1/2) with fraction characters (½)");
             ui.checkbox(&mut pr.ac_ordinals, "Ordinals (1st) with superscript");
+            ui.checkbox(&mut pr.ac_lists, "Automatic bulleted and numbered lists");
             ui.checkbox(&mut pr.autocorrect, "Replace text as you type");
             ui.add_space(4.0);
             let mut from = d.get("from", "");
@@ -2157,6 +2249,7 @@ fn body(app: &mut SlideApp, ui: &mut Ui, d: &mut Dialog) -> bool {
             ok || cancel
         }
         "gridOptions" => grid_options(app, ui, d),
+        "columns" => columns_dialog(app, ui, d),
         "preferences" => {
             // The controls apply as they change, so the dialog remembers what it opened with and
             // Cancel (or Esc, or the close button: see `show`) puts that back.
@@ -2466,21 +2559,7 @@ const DATE_LANGS: &[(&str, &str)] = &[
     ("sv-SE", "Swedish"),
 ];
 
-const DATE_KINDS: [&str; 13] = [
-    "datetime1",
-    "datetime2",
-    "datetime3",
-    "datetime4",
-    "datetime5",
-    "datetime6",
-    "datetime7",
-    "datetime8",
-    "datetime9",
-    "datetime10",
-    "datetime11",
-    "datetime12",
-    "datetime13",
-];
+use deckcraft_text::datetime::DATE_KINDS;
 
 /// Samples `field_text` can compute for `lang`. Named months and AM/PM exist for English only;
 /// other languages keep the numeric date and the 24-hour times.
@@ -2577,6 +2656,61 @@ fn grid_options(app: &mut SlideApp, ui: &mut Ui, d: &mut Dialog) -> bool {
         let spacing = num(d, "spacing", app.session.prefs.grid_spacing);
         match app.run("view.gridOptions", json!({"spacing": spacing, "snap": snap, "smartGuides": smart, "gridlines": gridlines, "guides": guides})) {
             Ok(_) => return true,
+            Err(e) => {
+                d.fields.insert("error".into(), e);
+                return false;
+            }
+        }
+    }
+    cancel
+}
+
+/// The Columns dialog's changed fields as `format.columns` params: Number and Spacing (inches,
+/// sent in points). A field left as the dialog showed it is left out, so each selected text box
+/// keeps its own value; `None` when neither field changed.
+fn columns_value(d: &Dialog, shown_count: &str, shown_spacing: &str) -> Result<Option<Value>, String> {
+    let mut p = serde_json::Map::new();
+    let count = field_of(d, "count");
+    if count != shown_count {
+        let n = count.trim().parse::<u32>().ok().filter(|n| (1..=16).contains(n)).ok_or("Number must be a whole number from 1 to 16")?;
+        p.insert("count".into(), json!(n));
+    }
+    let spacing = field_of(d, "spacing");
+    if spacing != shown_spacing {
+        let inches = spacing
+            .trim()
+            .trim_end_matches("in")
+            .trim_end_matches('"')
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite() && (0.0..=22.0).contains(v))
+            .ok_or("Spacing must be from 0 to 22 inches")?;
+        p.insert("spacing".into(), json!(inches * 72.0));
+    }
+    Ok((!p.is_empty()).then_some(Value::Object(p)))
+}
+
+/// Columns: the number of columns in the text box and the space between them. OK applies one
+/// `format.columns` call with the fields that changed, or none when neither did; Cancel leaves
+/// the text box as it was.
+fn columns_dialog(app: &mut SlideApp, ui: &mut Ui, d: &mut Dialog) -> bool {
+    let count = d.params.get("count").and_then(Value::as_u64).unwrap_or(1).to_string();
+    let spacing = num_text(d.params.get("spacing").and_then(Value::as_f64).unwrap_or(0.0) / 72.0);
+    field(ui, d, "Number:", "count", &count);
+    field(ui, d, "Spacing (in):", "spacing", &spacing);
+    if let Some(err) = d.fields.get("error").cloned().filter(|s| !s.is_empty()) {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(err).color(Color32::from_rgb(0xB0, 0x30, 0x30)));
+    }
+    let (ok, cancel) = buttons(ui, "OK");
+    if ok {
+        let applied = columns_value(d, &count, &spacing).and_then(|p| match p {
+            Some(p) => app.run("format.columns", p).map(|_| ()),
+            None => Ok(()),
+        });
+        match applied {
+            Ok(()) => return true,
             Err(e) => {
                 d.fields.insert("error".into(), e);
                 return false;
@@ -3303,6 +3437,10 @@ mod font_dialog_tests;
 mod size_position_tests;
 
 #[cfg(test)]
+#[path = "columns_dialog_tests.rs"]
+mod columns_dialog_tests;
+
+#[cfg(test)]
 #[path = "photo_album_tests.rs"]
 mod photo_album_tests;
 
@@ -3404,6 +3542,55 @@ mod tests {
         let mut h = link(Action::Url { url: address.into() }, tip);
         h.highlight_click = tip == "glow";
         h
+    }
+
+    /// Header & Footer ▸ Apply without picking a format leaves a slide's existing date field in
+    /// its own format instead of rewriting it to the default one.
+    #[test]
+    fn header_footer_apply_keeps_an_existing_date_format() {
+        use std::sync::Arc;
+
+        use egui::vec2;
+        use egui_kittest::kittest::Queryable as _;
+        use serde_json::json;
+
+        use crate::SlideApp;
+        let mut session = deckcraft_engine::Session::with_new();
+        session.execute("design.headerFooter", &json!({"date": true, "dateText": "", "dateFormat": "datetime4", "all": true})).unwrap();
+        // A file whose document-level format is unset, as an imported deck's is.
+        Arc::make_mut(&mut session.doc_mut().unwrap().doc).header_footer.date_format = String::new();
+        let date_fields = |app: &SlideApp| -> Vec<String> {
+            app.session
+                .doc()
+                .unwrap()
+                .doc
+                .slides
+                .iter()
+                .flat_map(|sl| sl.shapes.iter())
+                .filter(|sh| sh.ph_type() == Some(deckcraft_model::PhType::Date))
+                .flat_map(|sh| sh.text.iter())
+                .flat_map(|t| t.paragraphs.iter())
+                .flat_map(|p| p.runs.iter())
+                .filter_map(|r| match &r.kind {
+                    deckcraft_model::text::RunKind::Field { field } => Some(field.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut harness = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+            |ui, app: &mut SlideApp| {
+                app.logic(ui.ctx());
+                app.ui(ui);
+            },
+            SlideApp::new(session, crate::Services::default()),
+        );
+        harness.run_steps(2);
+        assert_eq!(date_fields(harness.state()), vec!["datetime4".to_string()]);
+        harness.state_mut().run("app.dialog", json!({"id": "headerFooter"})).unwrap();
+        harness.run_steps(2);
+        harness.get_by_label("Apply").click_accesskit();
+        harness.run_steps(3);
+        assert_eq!(date_fields(harness.state()), vec!["datetime4".to_string()], "the dialog left the field's format alone");
     }
 
     /// The Export… dialog (Animated GIF) shows the GIF options and exports through `file.export` (#171).
@@ -3762,3 +3949,7 @@ mod about_credits_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "preferences_tests.rs"]
+mod preferences_tests;
